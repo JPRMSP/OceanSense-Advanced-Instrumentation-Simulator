@@ -5,9 +5,9 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import plotly.express as px
 from scipy.signal import spectrogram
-from scipy.ndimage import gaussian_filter
 import time
 import math
+import pandas as pd
 
 st.set_page_config(page_title="OceanSense Advanced", layout="wide", initial_sidebar_state="expanded")
 st.title("🌊 OceanSense Advanced — Oceanography & Instrumentation Simulator")
@@ -27,24 +27,97 @@ np.random.seed(seed)
 # -----------------------------
 def sound_speed_unesco(T, S, z):
     # simplified UNESCO empirical formula
-    return 1449.2 + 4.6*T - 0.055*T**2 + 0.00029*T**3 + (1.34 - 0.01*T)*(S-35) + 0.016*z
+    return 1449.2 + 4.6*T - 0.055*(T**2) + 0.00029*(T**3) + (1.34 - 0.01*T)*(S-35) + 0.016*z
 
 def density_approx(T, S):
-    # very simple density approx (placeholder, physically plausible)
     return 1000 + 0.8*S - 0.2*T
 
-def perlin_noise(shape=(100,100), scale=3.0, octaves=4, seed=0):
-    # simple fractal noise using random layers + gaussian smoothing (no external libs)
-    rng = np.random.RandomState(seed)
-    base = np.zeros(shape)
-    for i in range(octaves):
-        freq = 2**i
-        noise = rng.rand(shape[0]//freq + 1, shape[1]//freq + 1)
-        noise = np.kron(noise, np.ones((freq, freq)))
-        noise = noise[:shape[0], :shape[1]]
-        base += gaussian_filter(noise, sigma=scale/(i+1))
-    base = (base - base.min()) / (base.ptp() + 1e-9)
-    return base
+def perlin_noise(shape, scale=10, seed=0):
+    """
+    Stable Perlin-like noise generator using gradients and smooth interpolation.
+    Note: keep grid sizes moderate (<=200) for responsiveness.
+    """
+    np.random.seed(seed)
+    h, w = shape
+    # choose grid cell size
+    cell = max(3, int(scale))
+    # gradient grid size
+    gy = h // cell + 2
+    gx = w // cell + 2
+    # random gradient vectors
+    grad_x = np.random.randn(gy, gx)
+    grad_y = np.random.randn(gy, gx)
+    norm = np.sqrt(grad_x**2 + grad_y**2) + 1e-9
+    grad_x /= norm
+    grad_y /= norm
+
+    # coordinate arrays
+    ys = np.linspace(0, (gy - 2), h, endpoint=False)
+    xs = np.linspace(0, (gx - 2), w, endpoint=False)
+    y0 = ys.astype(int)
+    x0 = xs.astype(int)
+    yf = ys - y0
+    xf = xs - x0
+
+    def fade(t):
+        return 6*t**5 - 15*t**4 + 10*t**3
+
+    u = fade(xf)
+    v = fade(yf)
+
+    noise = np.zeros((h, w), dtype=float)
+
+    # compute per-pixel using vectorized outer operations for rows/cols
+    for i in range(h):
+        iy = y0[i]
+        vy = v[i]
+        dy = yf[i]
+        g00x = grad_x[iy, x0]
+        g00y = grad_y[iy, x0]
+        g10x = grad_x[iy, x0+1]
+        g10y = grad_y[iy, x0+1]
+        g01x = grad_x[iy+1, x0]
+        g01y = grad_y[iy+1, x0]
+        g11x = grad_x[iy+1, x0+1]
+        g11y = grad_y[iy+1, x0+1]
+
+        dx = xf  # vector across columns
+        # dot products across row
+        n00 = g00x * dx + g00y * dy
+        n10 = g10x * (dx - 1) + g10y * dy
+        n01 = g01x * dx + g01y * (dy - 1)
+        n11 = g11x * (dx - 1) + g11y * (dy - 1)
+
+        nx0 = n00 * (1 - u) + n10 * u
+        nx1 = n01 * (1 - u) + n11 * u
+        noise[i, :] = nx0 * (1 - vy) + nx1 * vy
+
+    # normalize safely
+    noise = (noise - noise.min()) / (noise.max() - noise.min() + 1e-9)
+    return noise
+
+def synth_noise(ntype, duration, fs):
+    t = np.linspace(0, duration, int(duration*fs), endpoint=False)
+    if ntype == "Rain":
+        return np.random.randn(len(t)) * 0.2
+    if ntype == "Shipping":
+        freqs = [20, 50, 80]
+        signal = sum([0.4*np.sin(2*np.pi*f*t) for f in freqs])
+        signal += np.random.randn(len(t))*0.05
+        return signal
+    if ntype == "Dolphin Clicks":
+        signal = np.zeros(len(t))
+        num_clicks = np.random.randint(20,60)
+        click_pos = np.random.choice(len(t), num_clicks, replace=False)
+        for p in click_pos:
+            width = max(1, int(0.001*fs))
+            signal[p:p+width] += np.hanning(width) * np.random.uniform(0.5,1.0)
+        return signal
+    if ntype == "Seismic":
+        return np.sin(2*np.pi*5*t) * np.exp(-t*1.5) + np.random.randn(len(t))*0.02
+    if ntype == "Turbulence":
+        return np.cumsum(np.random.randn(len(t))) * 0.0005
+    return np.zeros_like(t)
 
 # -----------------------------
 # Section: Real-time Ocean Buoy Telemetry
@@ -54,7 +127,6 @@ col1, col2, col3 = st.columns([1,1,1])
 
 with col1:
     st.subheader("Live Sensor Stream")
-    # base states
     base_temp = st.number_input("Base Temperature (°C)", value=15.0, step=0.1)
     base_sal = st.number_input("Base Salinity (PSU)", value=35.0, step=0.1)
     base_ph = st.number_input("Base pH", value=8.0, step=0.01)
@@ -69,11 +141,9 @@ with col3:
     enable_spike = st.checkbox("Enable Salinity/pH spike events", value=True)
     pollution_rate = st.slider("Pollution rate", 0.0, 1.0, 0.1)
 
-# display telemetry as metrics
 telemetry_placeholder = st.empty()
 telemetry_chart = st.empty()
 
-# generate a buffer for live plotting
 buffer_len = 200
 time_buf = list(np.linspace(-buffer_len+1, 0, buffer_len))
 temp_buf = [base_temp + np.random.randn()*0.05 for _ in range(buffer_len)]
@@ -83,31 +153,24 @@ chl_buf = [base_chl + np.random.randn()*0.01 for _ in range(buffer_len)]
 wave_buf = [wave_amp * np.sin(i*0.2) + np.random.randn()*0.05 for i in range(buffer_len)]
 
 def update_telemetry():
-    # simulate increments
     global temp_buf, sal_buf, ph_buf, chl_buf, wave_buf, time_buf
     t_now = time.time()
-    # simulate small drifts + occasional spikes
     temp = temp_buf[-1] + np.random.randn()*0.02 + 0.001*(base_temp - temp_buf[-1])
     sal = sal_buf[-1] + np.random.randn()*0.01 + 0.0005*(base_sal - sal_buf[-1])
     ph = ph_buf[-1] + np.random.randn()*0.003 + 0.0002*(base_ph - ph_buf[-1])
     chl = max(0, chl_buf[-1] + np.random.randn()*0.01 + 0.0003*(base_chl - chl_buf[-1]))
     wave = wave_amp * np.sin(t_now*0.5) + np.random.randn()*0.05
-    # occasional events
     if enable_spike and (np.random.rand() < 0.005*max(1,pollution_rate*10)):
         sal += np.random.uniform(0.5, 3.0)
         ph -= np.random.uniform(0.1, 0.5)
-    # append
     time_buf.append(time_buf[-1] + 1)
     temp_buf.append(temp); sal_buf.append(sal); ph_buf.append(ph); chl_buf.append(chl); wave_buf.append(wave)
-    # keep length
     for buf in [time_buf, temp_buf, sal_buf, ph_buf, chl_buf, wave_buf]:
         while len(buf) > buffer_len:
             buf.pop(0)
     return temp, sal, ph, chl, wave
 
-# run one update immediately (so metrics have values)
 _ = update_telemetry()
-# display metrics
 with telemetry_placeholder.container():
     tcol1, tcol2, tcol3, tcol4 = st.columns(4)
     tcol1.metric("Temp (°C)", f"{temp_buf[-1]:.2f}")
@@ -115,25 +178,19 @@ with telemetry_placeholder.container():
     tcol3.metric("pH", f"{ph_buf[-1]:.2f}")
     tcol4.metric("Chlorophyll proxy", f"{chl_buf[-1]:.2f}")
 
-# live chart
 with telemetry_chart.container():
     fig, ax = plt.subplots(2,2, figsize=(9,6))
-    ax[0,0].plot(temp_buf, label="Temp")
-    ax[0,0].set_title("Temperature (°C)")
-    ax[0,1].plot(sal_buf, label="Salinity")
-    ax[0,1].set_title("Salinity (PSU)")
-    ax[1,0].plot(ph_buf, label="pH")
-    ax[1,0].set_title("pH")
-    ax[1,1].plot(chl_buf, label="Chlorophyll")
-    ax[1,1].set_title("Chlorophyll proxy")
+    ax[0,0].plot(temp_buf, label="Temp"); ax[0,0].set_title("Temperature (°C)")
+    ax[0,1].plot(sal_buf, label="Salinity"); ax[0,1].set_title("Salinity (PSU)")
+    ax[1,0].plot(ph_buf, label="pH"); ax[1,0].set_title("pH")
+    ax[1,1].plot(chl_buf, label="Chlorophyll"); ax[1,1].set_title("Chlorophyll proxy")
     plt.tight_layout()
     st.pyplot(fig)
 
-# if realtime or fast, auto-update small number of times to show animation
 if time_step is not None:
     for _ in range(3 if sim_speed=="Realtime" else 10):
         _ = update_telemetry()
-        # update metrics quickly
+        # quick metric update
         telemetry_placeholder.metric("Temp (°C)", f"{temp_buf[-1]:.2f}")
         telemetry_placeholder.metric("Salinity (PSU)", f"{sal_buf[-1]:.2f}")
         telemetry_placeholder.metric("pH", f"{ph_buf[-1]:.2f}")
@@ -147,15 +204,12 @@ st.header("🗺️ 3D Bathymetry & Remote-Sensing Layers")
 col_a, col_b = st.columns([1,1])
 
 with col_a:
-    size = st.slider("Bathymetry grid size", 50, 200, 100)
-    roughness = st.slider("Seafloor roughness", 0.5, 5.0, 2.0)
+    size = st.slider("Bathymetry grid size (pixels)", 50, 150, 100)
+    roughness = st.slider("Seafloor roughness (scale)", 1, 8, 3)
     seed_bathy = st.number_input("Bathymetry seed", value=1, step=1)
-    bathy = perlin_noise((size,size), scale=roughness, octaves=4, seed=seed_bathy)
-    # scale to depths (negative values represent depth)
+    bathy = perlin_noise((size,size), scale=roughness, seed=seed_bathy)
     depth_scale = st.slider("Max depth (m)", 100, 11000, 4000)
-    depth_map = (bathy * depth_scale) * -1  # negative
-
-    # 3D surface
+    depth_map = (bathy * depth_scale) * -1  # negative for depth
     fig3d = go.Figure(data=[go.Surface(z=depth_map, colorscale='Viridis', showscale=True)])
     fig3d.update_layout(title="Procedural Bathymetry (3D Surface)", autosize=True, height=450)
     st.plotly_chart(fig3d, use_container_width=True)
@@ -164,9 +218,9 @@ with col_b:
     st.subheader("Procedural Remote Sensing Layers")
     rs_seed = st.number_input("Remote-sensing seed", value=10, step=1)
     rs_size = size
-    sst = perlin_noise((rs_size, rs_size), scale=3.0, octaves=3, seed=rs_seed) * 10 + 15  # SST in °C
-    chl = perlin_noise((rs_size, rs_size), scale=2.0, octaves=3, seed=rs_seed+3) * 3  # chlorophyll proxy
-    ssh = perlin_noise((rs_size, rs_size), scale=4.0, octaves=2, seed=rs_seed+7) * 0.5  # sea surface height m
+    sst = perlin_noise((rs_size, rs_size), scale=3.0, seed=rs_seed) * 10 + 15  # SST in °C
+    chl = perlin_noise((rs_size, rs_size), scale=2.0, seed=rs_seed+3) * 3  # chlorophyll proxy
+    ssh = perlin_noise((rs_size, rs_size), scale=4.0, seed=rs_seed+7) * 0.5  # sea surface height m
     col_choice = st.selectbox("Layer to display", ["SST", "Chlorophyll", "Sea Surface Height"])
     layer = {"SST": sst, "Chlorophyll": chl, "Sea Surface Height": ssh}[col_choice]
     fig_rs = px.imshow(layer, color_continuous_scale="thermal" if col_choice=="SST" else "viridis")
@@ -184,7 +238,7 @@ with rov_col1:
     heading = st.slider("Heading (°)", 0, 359, 0)
     pitch = st.slider("Pitch (°)", -30, 30, 0)
     thrust = st.slider("Thrust (%)", 0, 100, 50)
-    battery = st.slider("Battery (%)", 0, 100, 80)
+    battery_setting = st.slider("Initial Battery (%)", 0, 100, 80)
     simulate_rov = st.button("Run ROV step")
 with rov_col2:
     st.subheader("ROV Telemetry")
@@ -193,28 +247,21 @@ with rov_col2:
     rov_battery = st.empty()
     rov_sonar = st.empty()
 
-# simple ROV state
 if "rov_state" not in st.session_state:
-    st.session_state.rov_state = {"depth": 0.0, "heading": 0.0, "battery": battery, "x": size//2, "y": size//2}
+    st.session_state.rov_state = {"depth": 0.0, "heading": 0.0, "battery": battery_setting, "x": size//2, "y": size//2}
 
 def rov_step(target_depth, heading, pitch, thrust):
     state = st.session_state.rov_state
-    # depth control: move proportionally to thrust and pitch
     depth_change = thrust/100.0 * math.sin(math.radians(pitch)) * 5.0
-    # heading adjustment smooth
     state["heading"] += (heading - state["heading"]) * 0.1
-    # vertical motion
     state["depth"] += depth_change
     state["depth"] = max(0, state["depth"])
-    # battery drain
     state["battery"] -= abs(thrust)/100.0 * 0.05 + 0.01
     state["battery"] = max(0, state["battery"])
-    # horizontal position movement based on heading & thrust
     dx = math.cos(math.radians(state["heading"])) * thrust/100.0 * 0.5
     dy = math.sin(math.radians(state["heading"])) * thrust/100.0 * 0.5
     state["x"] = np.clip(state["x"] + dx, 0, size-1)
     state["y"] = np.clip(state["y"] + dy, 0, size-1)
-    # sonar returns distance to seafloor at x,y given depth_map
     seabed_depth = -depth_map[int(max(0,min(size-1,state["y"]))), int(max(0,min(size-1,state["x"])))]
     distance_to_seafloor = max(0, seabed_depth - state["depth"])
     st.session_state.rov_state = state
@@ -227,7 +274,6 @@ if simulate_rov:
     rov_battery.write(f"Battery: {state['battery']:.1f} %")
     rov_sonar.write(f"Sonar distance to seafloor: {sonar_dist:.2f} m")
 
-# show ROV position on bathy map (2D)
 fig_pos = px.imshow(depth_map, origin='lower', color_continuous_scale='Blues', title="ROV Position (2D Bathymetry)")
 if "rov_state" in st.session_state:
     s = st.session_state.rov_state
@@ -235,14 +281,13 @@ if "rov_state" in st.session_state:
 st.plotly_chart(fig_pos, use_container_width=True)
 
 # -----------------------------
-# Section: Virtual CTD profiler
+# Virtual CTD profiler
 # -----------------------------
 st.header("📊 Virtual CTD Profiling")
 ctd_col1, ctd_col2 = st.columns([1,1])
 with ctd_col1:
     max_profile_depth = st.slider("CTD max depth for profile (m)", 50, int(abs(depth_map.min())), 500)
     profile_steps = st.slider("Profile steps", 10, 500, 100)
-    # create synthetic vertical profiles using base telemetry values and added stratification
     z = np.linspace(0, max_profile_depth, profile_steps)
     thermocline_depth = st.slider("Thermocline depth (m)", 10, 200, 50)
     temp_surface = base_temp + np.random.randn()*0.2
@@ -262,13 +307,12 @@ with ctd_col2:
     st.write(f"Mean Salinity: {np.mean(sal_profile):.2f} PSU")
     st.write(f"Min Sound Speed: {np.min(sound_profile):.2f} m/s  |  Max: {np.max(sound_profile):.2f} m/s")
     if st.button("Export CTD profile (CSV)"):
-        import pandas as pd
         df = pd.DataFrame({"depth_m":z, "temp_C":temp_profile, "sal_PSU":sal_profile, "sound_m_s":sound_profile, "density_kg_m3":density_profile})
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button("Download CTD CSV", csv, "ctd_profile.csv", "text/csv")
 
 # -----------------------------
-# Section: Pollution Pathway Visualizer (Advection-Diffusion)
+# Pollution Pathway Visualizer (Advection-Diffusion)
 # -----------------------------
 st.header("🛢️ Pollution Pathway Visualizer (Advection–Diffusion)")
 pp_col1, pp_col2 = st.columns([1,1])
@@ -284,69 +328,42 @@ with pp_col2:
     st.subheader("Run Simulation")
     grid = np.zeros((sim_grid, sim_grid))
     grid[source_y, source_x] = 1.0
-    # create advection velocity field
     angle_rad = math.radians(current_angle)
     vx = adv_strength * math.cos(angle_rad)
     vy = adv_strength * math.sin(angle_rad)
     for t_step in range(steps_sim):
         lap = (np.roll(grid,1,0) + np.roll(grid,-1,0) + np.roll(grid,1,1) + np.roll(grid,-1,1) - 4*grid)
         grid = grid + diff_coeff * lap + 0.01 * np.random.randn(*grid.shape)
-        # advection: shift slightly in flow direction
         shiftx = int(np.sign(vx))
         shifty = int(np.sign(vy))
         if shiftx != 0:
             grid = np.roll(grid, shiftx, axis=1)
         if shifty != 0:
             grid = np.roll(grid, shifty, axis=0)
-        # decay
         grid *= 0.999
     fig_pp = px.imshow(grid, color_continuous_scale="inferno", title="Pollution Concentration")
     st.plotly_chart(fig_pp, use_container_width=True)
 
 # -----------------------------
-# Section: Underwater Noise Comparison Dashboard
+# Underwater Noise Comparison Dashboard
 # -----------------------------
 st.header("🔊 Underwater Noise Comparison Dashboard")
 noise_types = ["Rain", "Shipping", "Dolphin Clicks", "Seismic", "Turbulence"]
 selected_noises = st.multiselect("Select noise types to compare", noise_types, default=["Rain", "Shipping", "Dolphin Clicks"])
 duration = st.slider("Duration (s) for spectrogram", 1, 5, 2)
 fs = 4000
-
-def synth_noise(ntype, duration, fs):
-    t = np.linspace(0, duration, int(duration*fs), endpoint=False)
-    if ntype == "Rain":
-        return np.random.randn(len(t)) * 0.2
-    if ntype == "Shipping":
-        freqs = [20, 50, 80]
-        signal = sum([0.4*np.sin(2*np.pi*f*t) for f in freqs])
-        signal += np.random.randn(len(t))*0.05
-        return signal
-    if ntype == "Dolphin Clicks":
-        signal = np.zeros(len(t))
-        num_clicks = np.random.randint(20,60)
-        click_pos = np.random.choice(len(t), num_clicks, replace=False)
-        for p in click_pos:
-            width = int(0.001*fs)
-            signal[p:p+width] += np.hanning(width) * np.random.uniform(0.5,1.0)
-        return signal
-    if ntype == "Seismic":
-        return np.sin(2*np.pi*5*t) * np.exp(-t*1.5) + np.random.randn(len(t))*0.02
-    if ntype == "Turbulence":
-        return np.cumsum(np.random.randn(len(t))) * 0.0005
-
-# produce spectrograms
 spec_cols = st.columns(len(selected_noises) if selected_noises else 1)
 for i, ntype in enumerate(selected_noises):
     sig = synth_noise(ntype, duration, fs)
     f, ts, Sxx = spectrogram(sig, fs, nperseg=256, noverlap=128)
-    ax_fig = plt.figure(figsize=(4,3))
+    fig_spec = plt.figure(figsize=(4,3))
     plt.pcolormesh(ts, f, 10*np.log10(Sxx+1e-9))
     plt.ylabel('Freq [Hz]'); plt.xlabel('Time [sec]')
     plt.title(f"Spectrogram: {ntype}")
-    spec_cols[i].pyplot(ax_fig)
+    spec_cols[i].pyplot(fig_spec)
 
 # -----------------------------
-# Section: Light Attenuation & Photosynthesis
+# Light Attenuation & Photosynthesis
 # -----------------------------
 st.header("☀️ Light Attenuation & Primary Productivity")
 la_col1, la_col2 = st.columns([1,1])
@@ -360,7 +377,6 @@ with la_col1:
     plt.xlabel("I (units)"); plt.ylabel("Depth (m)"); plt.title("Beer-Lambert Light Attenuation")
     st.pyplot(fig_la)
 with la_col2:
-    # simple photosynthesis model: P = Pmax * I/(I+Ik) * nutrient limitation
     Pmax = st.number_input("Max primary productivity Pmax (mgC m⁻² d⁻¹)", value=200.0)
     Ik = st.number_input("Saturation irradiance Ik", value=100.0)
     nutrient_lim = st.slider("Nutrient limitation factor", 0.0, 1.0, 0.8)
@@ -370,7 +386,7 @@ with la_col2:
     st.pyplot(fig_pprod)
 
 # -----------------------------
-# Section: Simple Marine Ecosystem Simulator (Lotka-Volterra style)
+# Marine Ecosystem Simulator
 # -----------------------------
 st.header("🌱 Marine Ecosystem Simulator (Phytoplankton–Zooplankton)")
 eco_col1, eco_col2 = st.columns([1,1])
@@ -383,7 +399,6 @@ with eco_col1:
 with eco_col2:
     P0 = st.number_input("Initial phytoplankton", value=100.0)
     Z0 = st.number_input("Initial zooplankton", value=20.0)
-    # discrete time simulation
     P = np.zeros(sim_days); Z = np.zeros(sim_days); t = np.arange(sim_days)
     P[0], Z[0] = P0, Z0
     for day in range(1, sim_days):
@@ -398,7 +413,7 @@ with eco_col2:
     st.pyplot(fig_eco)
 
 # -----------------------------
-# Section: Tectonic Plates Animation (simplified)
+# Tectonic Plates Animation (simplified)
 # -----------------------------
 st.header("🌋 Tectonic Plates & Oceanic Crust Simulator")
 tp_col1, tp_col2 = st.columns([1,1])
@@ -406,8 +421,7 @@ with tp_col1:
     plates = st.slider("Number of tectonic plates (sim)", 2, 8, 4)
     plate_seed = st.number_input("Plate seed", value=7, step=1)
     plate_move = st.slider("Plate movement scale", 0.0, 5.0, 1.0)
-    base_plate_map = perlin_noise((size,size), scale=3.0, octaves=3, seed=plate_seed)
-    # assign plates by k-means-like random seeds
+    base_plate_map = perlin_noise((size,size), scale=3.0, seed=plate_seed)
     rng = np.random.RandomState(plate_seed)
     centers = rng.randint(0, size, size=(plates, 2))
     plate_map = np.zeros((size,size), dtype=int)
@@ -422,27 +436,22 @@ with tp_col2:
     st.write("- Divergent margins: where adjacent plates move apart (visualized by color gradients).")
     st.write("- Convergent: collisions generate 'trenches' in bathymetry (procedural).")
     if st.button("Apply plate movement step"):
-        # apply a simple displacement to bathymetry to mimic ridge/trench formation
         for p in range(plates):
             mask = (plate_map==p)
-            # shift mask elevation slightly
             shift = (np.random.randn()*0.5 + plate_move*0.1)
             depth_map[mask] += shift
         st.success("Applied plate movement to bathymetry!")
 
 # -----------------------------
-# Section: EEZ Visualizer & UNCLOS Quiz
+# EEZ Visualizer & UNCLOS Quiz
 # -----------------------------
 st.header("⚖️ EEZ Visualizer & Interactive UNCLOS Learning")
 eez_col1, eez_col2 = st.columns([1,1])
 with eez_col1:
-    st.subheader("Drawn EEZ (procedural)")
-    # create a simple circular island and buffer (EEZ)
     island_x = st.slider("Island center X", 0, size-1, size//3)
     island_y = st.slider("Island center Y", 0, size-1, size//3)
     island_radius = st.slider("Island radius (pixels)", 1, size//3, 8)
-    eez_dist = st.slider("EEZ radius (nautical miles -> pixels)", 12, 200, 200)  # not real scale; visual
-    # render
+    eez_dist = st.slider("EEZ radius (pixels, visual)", 12, size-1, 50)
     xx, yy = np.meshgrid(np.arange(size), np.arange(size))
     dist = np.sqrt((xx - island_x)**2 + (yy - island_y)**2)
     island_mask = dist <= island_radius
@@ -463,7 +472,7 @@ with eez_col2:
         st.info(f"You scored {score}/2")
 
 # -----------------------------
-# Section: Instrumentation Failure Simulator
+# Instrumentation Failure Simulator
 # -----------------------------
 st.header("🔧 Instrumentation Failure Simulator")
 if "fail_state" not in st.session_state:
@@ -489,48 +498,45 @@ with fail_col2:
         st.write("Sediment trap overflow — deposition rate spikes.")
 
 # -----------------------------
-# Section: Underwater Acoustic Communication Demo
+# Underwater Acoustic Communication Demo
 # -----------------------------
 st.header("📡 Underwater Acoustic Communication Demo")
 msg = st.text_input("Type a short message to send (ASCII characters only)", value="HELLO OCEAN")
 tx_freq = st.slider("Carrier frequency (Hz)", 1000, 50000, 12000)
 snr = st.slider("SNR (simulated dB)", 0, 40, 20)
 if st.button("Transmit message"):
-    # simple ASK modulation using ASCII -> bits -> waveform
     bits = ''.join([format(ord(c),'08b') for c in msg])
     bit_dur = 0.001
     fs_comm = 40000
-    t = np.arange(0, len(bits)*bit_dur, 1/fs_comm)
-    waveform = np.zeros_like(t)
+    t_comm = np.arange(0, len(bits)*bit_dur, 1/fs_comm)
+    waveform = np.zeros_like(t_comm)
     for i, b in enumerate(bits):
-        seg = (t >= i*bit_dur) & (t < (i+1)*bit_dur)
+        seg = (t_comm >= i*bit_dur) & (t_comm < (i+1)*bit_dur)
         if b == '1':
-            waveform[seg] = np.sin(2*np.pi*tx_freq*t[seg])
+            waveform[seg] = np.sin(2*np.pi*tx_freq*t_comm[seg])
         else:
             waveform[seg] = 0
-    # add underwater noise synthesized by mixing turbulence and shipping
-    noise = synth_noise("Turbulence", len(t)/fs_comm, fs_comm) + 0.2*synth_noise("Shipping", len(t)/fs_comm, fs_comm)
-    # scale noise to achieve target SNR
+    noise = synth_noise("Turbulence", len(t_comm)/fs_comm, fs_comm) + 0.2*synth_noise("Shipping", len(t_comm)/fs_comm, fs_comm)
     sig_power = np.mean(waveform**2) + 1e-12
     noise_power = np.mean(noise**2) + 1e-12
     desired_noise_power = sig_power / (10**(snr/10))
-    noise *= np.sqrt(desired_noise_power / (noise_power + 1e-12))
+    if noise_power > 0:
+        noise *= np.sqrt(desired_noise_power / (noise_power + 1e-12))
     rx = waveform + noise
-    # simple detection by envelope & threshold
     envelope = np.abs(np.convolve(rx, np.ones(int(fs_comm*bit_dur))/int(fs_comm*bit_dur), mode='same'))
     thresh = envelope.mean()*1.5
     rec_bits = []
     for i in range(len(bits)):
-        seg = int((i+0.5)*bit_dur*fs_comm)
-        rec_bits.append('1' if envelope[seg] > thresh else '0')
+        seg_idx = int((i+0.5)*bit_dur*fs_comm)
+        seg_idx = min(seg_idx, len(envelope)-1)
+        rec_bits.append('1' if envelope[seg_idx] > thresh else '0')
     rec_chars = ''.join([chr(int(''.join(rec_bits[i:i+8]),2)) for i in range(0,len(rec_bits),8)])
     st.write("Transmitted message:", msg)
     st.write("Received message (simulated):", rec_chars)
-    # show waveform & spectrogram
     fig_tx, ax_tx = plt.subplots(2,1,figsize=(8,4))
     ax_tx[0].plot(waveform[:2000]); ax_tx[0].set_title("Transmitted waveform (first samples)")
-    f, tt, Sxx = spectrogram(rx, fs_comm, nperseg=512, noverlap=256)
-    ax_tx[1].pcolormesh(tt, f, 10*np.log10(Sxx+1e-9)); ax_tx[1].set_ylabel("Freq (Hz)")
+    f_rx, tt, Sxx_rx = spectrogram(rx, fs_comm, nperseg=512, noverlap=256)
+    ax_tx[1].pcolormesh(tt, f_rx, 10*np.log10(Sxx_rx+1e-9)); ax_tx[1].set_ylabel("Freq (Hz)")
     st.pyplot(fig_tx)
 
 # -----------------------------
